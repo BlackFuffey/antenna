@@ -101,6 +101,19 @@ function request(host: string, passcode?: string, stream?: { pipe():void }, tsl=
     })
 }
 
+function parseEndpoint(endpoint: string, defaultPort: number): { hostname: string, port?: number } {
+    const match = endpoint.match( /^(.+?)(?::([0-9]{1,5}))?$/ );
+
+    if (!match) throw new Error(`Failed to parse endpoint "${endpoint}"`);
+
+    const [ hostname, port ] = match;
+
+    return {
+        hostname: match[1],
+        port: match[2]!==undefined && parseInt(match[2], 10)
+    }
+}
+
 function crash(errmsg: string, exitcode=1): never {
     console.error(`failure: ${errmsg}`);
     process.exit(exitcode)
@@ -130,8 +143,9 @@ function CA_runIf(flag: string, callback: ()=>any) {
 
 type AppSettings = (
         { 
-            mode: 'client'
+            mode: 'client';
             host: string;
+            port: number;
             passcode: string;
         } | {
             mode: 'server';
