@@ -1,3 +1,3 @@
 # antenna
 
-Quickly and securely transfer file over network with no setup
+Quickly and securely transfer file over IP directly with no setup
