@@ -8,7 +8,7 @@ import fsSync, { ReadStream, WriteStream } from 'fs'
 import type { SystemError } from "bun";
 
 import https from 'https';
-import http from 'http';
+import http  from 'http';
 import { TLSSocket } from 'tls';
 import crypto from "crypto";
 
@@ -36,7 +36,7 @@ parser
     .option('-w, --passcode <passcode>',        "Specify authentication passcode")
     .option('--no-passcode',                    "Don't use authentication passcode as server")
 
-    .option('--no-validate-fp',                 "Don't prompt to validate connection fingerprint.")
+    .option('--no-validate-fp',                 "Don't validate connection fingerprint.")
     .option('-t, --trust [yes/no/ask]',         "Auto-trust/untrust identity when unknown")
 
     .option('-f, --file <path>',                "Which file to read from or write to (defaults to -)", '-')
@@ -67,7 +67,7 @@ const settings: AppSettings = {
 
                 if (Number.isNaN(port)) throw new Error(`Unable to parse port. Match: ${match}`);
 
-                return { host, port, validateFP: !!flags.validateFp };
+                return { host, port };
             })()
         }
 
@@ -105,52 +105,106 @@ const settings: AppSettings = {
         else return flags.passcode
     })(),
 
-    trust: flags.trust
+    trust: flags.trust,
+
+    validateFP: !flags.noValidateFp
 }
 
 if (settings.mode === 'client') {
     const req = await client({
+        ...settings,
         hostname: settings.host,
-        port: settings.port,
-        action: settings.action,
-        passcode: settings.passcode,
-        validateFP: settings.validateFP,
-        contentLength: undefined,
-        trust: settings.trust
+        contentLength: (settings as { length: number|undefined }).length,
     });
 
-    if (settings.action === 'send') 
+    if (settings.action === 'send') {
         settings.readstream.pipe(req);
+        attachProgressSpinner('Transmitting Data', settings.length, settings.readstream)
 
-    else
+    } else {
         req.on('response', (res) => {
-
-            const length = (() => {
-                const str = res.headers['content-length'];
-                const num = Number(str);
-
-                if (Number.isNaN(num)) return undefined;
-                else return num;
-            })()
-
-            const spinner = spinProgress("Receiving Data", length);
-
             res.pipe(settings.writestream);
-
-            res.on('data', c => spinner.progress(c.length));
-
-            res.on('error', async e => {
-                await spinner.fail();
-
-                if (isSystemError(e)) syscrash(e);
-                else throw e;
-            })
-
-            res.on('end', () => spinner.finish())
+            attachProgressSpinner('Receiving Data', toNumOrUndefined(res.headers['content-length']), res)
         });
+    }
 } else {
+    const { req, res } = await server({
+        ...settings,
+        contentLength: (settings as { length: number|undefined }).length
+    })
 
+    if (settings.action === 'send') {
+        settings.readstream.pipe(res);
+        attachProgressSpinner('Transmitting Data', settings.length, settings.readstream)
+    } else {
+        req.pipe(settings.writestream);
+        attachProgressSpinner('Receiving Data', toNumOrUndefined(req.headers['content-length']), req)
+    }
 }
+
+async function server({ port, action, passcode, contentLength, trust }: {
+    port: number;
+    action: 'send' | 'receive';
+    passcode: string | undefined;
+    contentLength: number | undefined;
+    trust: 'yes' | 'no' | 'ask';
+}) { return new Promise<{req:http.IncomingMessage, res:http.ServerResponse}>(async (resolve) => {
+    const identity = await getKeyPair();
+
+    if (passcode) terminal.println(`Passcode: ${passcode}`);
+    else terminal.println(`No passcode required`)
+
+    const spinner = terminal.spin(`%spin$  Awaiting connection`)
+
+    const server = https.createServer({
+        ...identity,
+        requestCert: true,
+        rejectUnauthorized: false
+    }, async (req, res) => {
+        const cert = (req.socket as TLSSocket).getPeerCertificate();
+
+        if (passcode && req.headers['authorization'] !== passcode)
+            return res.writeHead(403).end('Forbidden\n');
+
+        if (!cert || Object.keys(cert).length === 0) 
+            return res.writeHead(496).end('Client Identity Required\n');
+        
+        if (req.url !== '/v1/antenna') 
+            return res.writeHead(404).end('Not Found\n');
+
+        if (req.headers['antenna-action'] === (action==='send' ? 'receive' : 'send'))
+            return res.writeHead(405).end('Incompatible Action\n')
+
+        server.close();
+
+        res.writeHead(100, {
+            'antenna-version': version(),
+            'antenna-action': action,
+            'antenna-hostname': os.hostname(),
+            'content-length': contentLength
+        }).write("Continue\n")
+
+        await spinner.resolve();
+
+        const peerId = crypto.createPublicKey(cert.raw)
+                             .export({ type: 'spki', format: 'pem' }) as string
+        const peerName = (() => {
+            const name = req.headers['antenna-hostname'];
+            return typeof name === 'string' ? name : 'No Name';
+        })();
+    
+        const fp = getFingerprint(identity.cert, peerId).toUpperCase();
+
+        terminal.println(`Connection Fingerprint: ${fp.slice(0,4)}-${fp.slice(4)}`);
+
+        if (!await checkIdentity(peerId, peerName))
+                handleTrusting(peerId, peerName, trust);
+
+        return resolve({req, res})
+    })
+
+    server.listen(port);
+})}
 
 async function client({ hostname, port, action, validateFP, contentLength, passcode, trust }: {
     hostname: string;
@@ -174,7 +228,7 @@ async function client({ hostname, port, action, validateFP, contentLength, passc
             'antenna-version': version(),
             'antenna-action': action,
             'antenna-hostname': os.hostname(),
-            'authentication': passcode,
+            'authorization': passcode,
             'content-length': contentLength,
             'expect': '100-continue',
         },
@@ -209,66 +263,16 @@ async function client({ hostname, port, action, validateFP, contentLength, passc
             req.off('error', onErr);
             return resolve(req);
         }
-
+        
         const serverIdentity = crypto.createPublicKey(
             (socket as TLSSocket).getPeerCertificate(true).raw
         ).export({ type: 'spki', format: 'pem' }) as string
 
-        const serverIdHash = crypto.createHash('sha256').update(serverIdentity, 'utf8').digest('hex');
+        const trusted = await checkIdentity(serverIdentity, serverInfo.hostname);
 
-        const existingName = await getIdentityInfo(serverIdHash);
+        if (!trusted) checkFingerprint(getFingerprint(identity.cert, serverIdentity));
 
-        if (existingName) {
-            if (existingName !== serverInfo.hostname) {
-                terminal.println(`'${serverInfo.hostname}' was previously known as '${existingName}' (${serverIdHash})`);
-                setIdentityInfo(serverIdHash, serverInfo.hostname);
-            }
-
-            terminal.println(`'${serverInfo.hostname}' has a trusted identity (${serverIdHash})`);
-            req.off('error', onErr);
-            return resolve(req)
-        }
-
-        const fingerprint = crypto.createHash('sha256')
-                                  .update(`${serverIdentity}${identity.cert}`, 'utf8')
-                                  .digest('hex')
-                                  .slice(0, 8);
-
-        
-        terminal.println(`'${serverInfo.hostname}' has an unknown identity (${serverIdHash})`)
-        terminal.println("Enter the fingerprint code as shown on the server to verify connection integrety")
-
-        let attempts = 0;
-        let input = "";
-
-        do {
-            attempts++;
-
-            input = (await terminal.ask("code: ")).trim().replaceAll(/-| /, '').toLowerCase();
-
-            if (input !== fingerprint) {
-                terminal.println("Code does not match, try again.")
-
-                if (attempts > 3)
-                    terminal.println("\x1b[31mIf you did enter the correct code, this connection may have been hijacked.\x1b[0m")
-            }
-
-        } while (input !== fingerprint)
-
-        if (trust === 'ask') {
-            if ((await terminal.ask('Trust this identity? [y/n] ')).includes('y'))
-                trust = 'yes';
-
-            else
-                trust = 'no';
-        }
-
-        if (trust === 'yes') {
-            setIdentityInfo(serverIdHash, serverInfo.hostname);
-            terminal.println(`Identity marked as trusted`);
-        } else {
-            terminal.println(`Not trusting this identity`);
-        }
+        handleTrusting(identity.cert, serverIdentity, trust);
 
         req.off('error', onErr);
         resolve(req);
@@ -288,7 +292,7 @@ async function client({ hostname, port, action, validateFP, contentLength, passc
 async function getKeyPair(): Promise<{ key: string, cert: string }> {
     const configDir = envPaths('antenna-ft').config;
     const keyPath = path.join(configDir, 'identity.key');
-    const certPath = path.join(configDir, 'identity.cert');
+    const certPath = path.join(configDir, 'selfId');
 
     await fs.mkdir(configDir, { recursive: true });
 
@@ -347,6 +351,70 @@ async function getKeyPair(): Promise<{ key: string, cert: string }> {
     })();
 
     return { key, cert };
+}
+
+function getFingerprint(selfId: string, peerId: string) {
+    return crypto.createHash('sha256')
+                 .update(`${peerId}${selfId}`, 'utf8')
+                 .digest('hex')
+                 .slice(0, 8);
+}
+
+async function checkFingerprint(fp: string) {
+    terminal.println("Enter the fingerprint code as shown on the server to verify connection integrety")
+
+    let attempts = 0;
+    let input = "";
+
+    do {
+        attempts++;
+
+        input = (await terminal.ask("code: ")).trim().replaceAll(/-| /, '').toLowerCase();
+
+        if (input !== fp) {
+            terminal.println("Code does not match, try again.")
+
+            if (attempts > 3)
+                terminal.println("\x1b[31mIf you did enter the correct code, this connection may have been hijacked.\x1b[0m")
+        }
+
+    } while (input !== fp)
+}
+
+async function checkIdentity(peerId: string, peerName: string) {
+    const peerHash = crypto.createHash('sha256').update(peerId, 'utf8').digest('hex');
+
+    const existingName = await getIdentityInfo(peerHash);
+
+    if (existingName) {
+        if (existingName !== peerName) {
+            terminal.println(`'${peerName}' was previously known as '${existingName}' (${peerHash})`);
+            setIdentityInfo(peerHash, peerName);
+        }
+
+        terminal.println(`'${peerName}' has a trusted identity (${peerHash})`);
+        return true;
+    }
+
+    terminal.println(`'${peerName}' has an unknown identity (${peerHash})`)
+    return false;
+}
+
+async function handleTrusting(identity: string, hostname: string, trust: 'yes'|'no'|'ask') {
+    if (trust === 'ask') {
+        if ((await terminal.ask('Trust this identity? [y/n] ')).includes('y'))
+            trust = 'yes';
+
+        else
+            trust = 'no';
+    }
+
+    if (trust === 'yes') {
+        setIdentityInfo(identity, hostname);
+        terminal.println(`Identity marked as trusted`);
+    } else {
+        terminal.println(`Not trusting this identity`);
+    }
 }
 
 async function getIdentityInfo(identity: string) {
@@ -419,6 +487,26 @@ function getFileLengthSync(filepath: string): number | undefined {
     }
 }
 
+function toNumOrUndefined(str: any) {
+    const num = Number(str);
+
+    if (Number.isNaN(num)) return undefined;
+        else return num;
+}
+
+function attachProgressSpinner(actionText: string, length: number|undefined, rs: NodeJS.ReadableStream) {
+    const spinner = spinProgress(actionText, length);
+
+    rs.on('data', (c: Buffer) => spinner.progress(c.length))
+    rs.on('error', async (e: unknown) => {
+        await spinner.fail();
+
+        if (isSystemError(e)) syscrash(e as SystemError);
+            else throw e;
+    })
+    rs.on('close', () => spinner.finish());
+}
+
 function spinProgress(actionText: string, length: number|undefined) {
     const spinner = terminal.spin(`%spin%  ${actionText}: -- MiB`);
 
@@ -485,7 +573,6 @@ type AppSettings = (
             mode: 'client';
             host: string;
             port: number;
-            validateFP: boolean;
         } | {
             mode: 'server';
             port: number;
@@ -502,6 +589,7 @@ type AppSettings = (
 ) & {
     passcode: string | undefined;
     trust: 'yes' | 'no' | 'ask';
+    validateFP: boolean;
 }
 
 // (C)ommander (A)ctions

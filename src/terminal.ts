@@ -6,6 +6,8 @@ const ttyfile = await fs.open('/dev/tty', 'r+');
 const input = new tty.ReadStream(ttyfile.fd);
 const output = new tty.WriteStream(ttyfile.fd);
 
+let lineLocked = false;
+
 const terminal = {
     async print(msg: string): Promise<void> {
         return new Promise((resolve, reject) => {
@@ -28,8 +30,10 @@ const terminal = {
         const rl = readline.createInterface({ input, output });
 
         return new Promise(resolve => {
+            lineLocked = true;
             rl.question(msg, answer => {
                 rl.close();
+                lineLocked = false;
                 resolve(answer);
             });
         });
@@ -78,14 +82,16 @@ const terminal = {
             let atFrame = 0;
 
             while (!finished) {
-                readline.clearLine(output, 0);
-                readline.cursorTo(output, 0);
+                if (!lineLocked) {
+                    readline.clearLine(output, 0);
+                    readline.cursorTo(output, 0);
 
-                output.write(msg.replace('%spin%', spin.frames[atFrame]!));
+                    output.write(msg.replace('%spin%', spin.frames[atFrame]!));
 
-                atFrame++;
-                if (atFrame >= spin.frames.length)
-                    atFrame = 0;
+                    atFrame++;
+                    if (atFrame >= spin.frames.length)
+                        atFrame = 0;
+                }
 
                 await new Promise(resolve => setTimeout(resolve, spin.interval));
             }
