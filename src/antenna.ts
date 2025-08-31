@@ -1,5 +1,6 @@
 import { Command } from "commander";
 import { version } from "../macros";
+import prettyMs from "pretty-ms";
 
 // @ts-ignore just treat this as any for now as im too lazy to write declarations
 import errno from 'errno'
@@ -36,16 +37,14 @@ parser
     .option('--no-passcode',                    "Don't use authentication passcode as server")
 
     .option('--no-validate-fp',                 "Don't prompt to validate connection fingerprint.")
-    .option('-t, --trust [y/n/ask]',            "Add peer identity to trust list")
+    .option('-t, --trust [yes/no/ask]',         "Auto-trust/untrust identity when unknown")
 
     .option('-f, --file <path>',                "Which file to read from or write to (defaults to -)", '-')
-
-    //.option('--tsl-type {regular|mutual}',                    "Disable fingerprint validation.")
 
     .action((options) => {
         CA_XOR('send', 'receive', 'you must specify one and only one of --send and --receive')(options);
         CA_XOR('active', 'passive', 'you must specify one and only one of --active and --passive')(options);
-        CA_oneOf('trust', ['y','yes','n','no','a','ask'])(options);
+        CA_oneOf('trust', ['yes','no','ask'])(options);
     })
     
 parser.parse();
@@ -104,7 +103,9 @@ const settings: AppSettings = {
         if (flags.passcode === true) return Math.floor(100000 + Math.random() * 900000);
 
         else return flags.passcode
-    })()
+    })(),
+
+    trust: flags.trust
 }
 
 if (settings.mode === 'client') {
@@ -115,6 +116,7 @@ if (settings.mode === 'client') {
         passcode: settings.passcode,
         validateFP: settings.validateFP,
         contentLength: undefined,
+        trust: settings.trust
     });
 
     if (settings.action === 'send') 
@@ -122,17 +124,42 @@ if (settings.mode === 'client') {
 
     else
         req.on('response', (res) => {
-            const length = 
+
+            const length = (() => {
+                const str = res.headers['content-length'];
+                const num = Number(str);
+
+                if (Number.isNaN(num)) return undefined;
+                else return num;
+            })()
+
+            const spinner = spinProgress("Receiving Data", length);
+
+            res.pipe(settings.writestream);
+
+            res.on('data', c => spinner.progress(c.length));
+
+            res.on('error', async e => {
+                await spinner.fail();
+
+                if (isSystemError(e)) syscrash(e);
+                else throw e;
+            })
+
+            res.on('end', () => spinner.finish())
         });
+} else {
+
 }
 
-async function client({ hostname, port, action, validateFP, contentLength, passcode }: {
+async function client({ hostname, port, action, validateFP, contentLength, passcode, trust }: {
     hostname: string;
     port: number;
     action: 'send' | 'receive';
     validateFP: boolean;
     passcode: string | undefined;
     contentLength: number | undefined;
+    trust: 'yes' | 'no' | 'ask';
 }): Promise<http.ClientRequest> { return new Promise(async (resolve) => {
 
     const identity = await getKeyPair();
@@ -178,7 +205,10 @@ async function client({ hostname, port, action, validateFP, contentLength, passc
             })
         })))()
         
-        if (!validateFP) return resolve(req);
+        if (!validateFP) {
+            req.off('error', onErr);
+            return resolve(req);
+        }
 
         const serverIdentity = crypto.createPublicKey(
             (socket as TLSSocket).getPeerCertificate(true).raw
@@ -195,6 +225,7 @@ async function client({ hostname, port, action, validateFP, contentLength, passc
             }
 
             terminal.println(`'${serverInfo.hostname}' has a trusted identity (${serverIdHash})`);
+            req.off('error', onErr);
             return resolve(req)
         }
 
@@ -219,13 +250,39 @@ async function client({ hostname, port, action, validateFP, contentLength, passc
                 terminal.println("Code does not match, try again.")
 
                 if (attempts > 3)
-                    terminal.println("\x1b[31mIf you did enter the correct code, someone may have hijacked the connection.\x1b[0m")
+                    terminal.println("\x1b[31mIf you did enter the correct code, this connection may have been hijacked.\x1b[0m")
             }
 
         } while (input !== fingerprint)
 
+        if (trust === 'ask') {
+            if ((await terminal.ask('Trust this identity? [y/n] ')).includes('y'))
+                trust = 'yes';
+
+            else
+                trust = 'no';
+        }
+
+        if (trust === 'yes') {
+            setIdentityInfo(serverIdHash, serverInfo.hostname);
+            terminal.println(`Identity marked as trusted`);
+        } else {
+            terminal.println(`Not trusting this identity`);
+        }
+
+        req.off('error', onErr);
         resolve(req);
     }))
+    
+    async function onErr(e: unknown) {
+        await spinner.reject();
+
+        if (isSystemError(e)) syscrash(e as SystemError);
+        throw e;
+    }
+
+    req.on('error', onErr);
+
 }) }
 
 async function getKeyPair(): Promise<{ key: string, cert: string }> {
@@ -362,6 +419,67 @@ function getFileLengthSync(filepath: string): number | undefined {
     }
 }
 
+function spinProgress(actionText: string, length: number|undefined) {
+    const spinner = terminal.spin(`%spin%  ${actionText}: -- MiB`);
+
+    let lastReceived = 0;
+    let totalReceived = 0;
+    const history: number[] = [];
+    const maxHistory = 5
+    let lastUpdated = Date.now();
+
+    const interval = setInterval(() => {
+        const now = Date.now();
+        const elapsed = (now - lastUpdated) / 1000; // seconds
+
+        const bytesPerSec = elapsed > 0 ? lastReceived / elapsed : 0;
+
+        const receivedMiB = (totalReceived / (1024 * 1024)).toFixed(2);
+        const speedMiB = (bytesPerSec / (1024 * 1024)).toFixed(2);
+
+        history.push(bytesPerSec);
+        if (history.length > maxHistory) history.shift();
+
+        const avgBytesPerSec = history.length > 0 
+            ? history.reduce((a, b) => a + b, 0) / history.length 
+            : 0;
+
+        let newSpinMsg = `%spin%  ${actionText}: ${receivedMiB}`
+
+        if (length) {
+            const percentage = Math.floor(totalReceived / length * 100);
+            const etaSec = Math.round((length - totalReceived)! / avgBytesPerSec); // seconds
+
+            const totalMiB = (length / (1024 * 1024)).toFixed(2);
+
+            newSpinMsg += `/${totalMiB}MiB ${percentage}% | ${speedMiB} MiB/s | ETA ${etaSec===Infinity ? '--' : prettyMs(etaSec * 1000)}`
+
+        } else newSpinMsg += `MiB | ${speedMiB} MiB/s | Content Length Unknown`
+
+        lastReceived = 0;
+        lastUpdated = now;
+
+        spinner.setline(newSpinMsg)
+    }, 1000)
+    
+    return {
+        progress(amount: number) {
+            lastReceived += amount;
+            totalReceived += amount;
+        },
+
+        async finish() {
+            clearInterval(interval);
+            return spinner.resolve();
+        },
+
+        async fail() {
+            clearInterval(interval);
+            return spinner.reject();
+        }
+    }
+}
+
 type AppSettings = (
         { 
             mode: 'client';
@@ -383,6 +501,7 @@ type AppSettings = (
         }
 ) & {
     passcode: string | undefined;
+    trust: 'yes' | 'no' | 'ask';
 }
 
 // (C)ommander (A)ctions
