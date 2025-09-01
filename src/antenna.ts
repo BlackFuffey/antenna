@@ -16,6 +16,12 @@ import fs from 'fs/promises'
 import os from 'os'
 import path from "path";
 import envPaths from "env-paths";
+
+import { execFile } from 'child_process';
+import { promisify } from "util";
+
+const execFileAsync = promisify(execFile);
+
 import terminal from "./terminal";
 
 const parser = new Command();
@@ -31,10 +37,10 @@ parser
     .option('-R, --receive',                    "Receive file")
 
     .option('-a, --active <host>',              "Perform action actively (be the client)")
-    .option('-p, --passive [port]',             "Perform action passively (be the server). Port defaults to 52110", '52110')
+    .option('-p, --passive [port]',             "Perform action passively (be the server). Port defaults to 52110")
 
     .option('-w, --passcode <passcode>',        "Specify authentication passcode")
-    .option('--no-passcode',                    "Don't use authentication passcode as server")
+    .option('-n, --no-passcode',                    "Don't use authentication passcode as server")
 
     .option('--no-validate-fp',                 "Don't validate connection fingerprint.")
     .option('-t, --trust [yes/no/ask]',         "Auto-trust/untrust identity when unknown")
@@ -44,7 +50,7 @@ parser
     .action((options) => {
         CA_XOR('send', 'receive', 'you must specify one and only one of --send and --receive')(options);
         CA_XOR('active', 'passive', 'you must specify one and only one of --active and --passive')(options);
-        CA_oneOf('trust', ['yes','no','ask'])(options);
+        CA_oneOf('trust', ['yes','no','ask',undefined])(options);
     })
     
 parser.parse();
@@ -67,13 +73,12 @@ const settings: AppSettings = {
 
                 if (Number.isNaN(port)) throw new Error(`Unable to parse port. Match: ${match}`);
 
-                return { host, port };
+                return { host };
             })()
         }
 
         else return {
             mode: 'server',
-            port: flags.passive,
         }
     })(),
 
@@ -100,14 +105,15 @@ const settings: AppSettings = {
     passcode: (() => {
         if (flags.passcode === false) return undefined;
 
-        if (flags.passcode === true) return Math.floor(100000 + Math.random() * 900000);
+        if (flags.passive && [undefined, true].includes(flags.passcode)) 
+            return Math.floor(100000 + Math.random() * 900000);
 
         else return flags.passcode
     })(),
 
-    trust: flags.trust,
-
-    validateFP: !flags.noValidateFp
+    trust: flags.trust ?? 'ask',
+    validateFP: !flags.noValidateFp,
+    port: typeof flags.passive === 'number' ? flags.passive : 52110
 }
 
 if (settings.mode === 'client') {
@@ -154,13 +160,14 @@ async function server({ port, action, passcode, contentLength, trust }: {
     if (passcode) terminal.println(`Passcode: ${passcode}`);
     else terminal.println(`No passcode required`)
 
-    const spinner = terminal.spin(`%spin$  Awaiting connection`)
+    const spinner = terminal.spin(`%spin% Listening on port ${port}`)
 
     const server = https.createServer({
         ...identity,
         requestCert: true,
         rejectUnauthorized: false
     }, async (req, res) => {
+        console.log('request received')
         const cert = (req.socket as TLSSocket).getPeerCertificate();
 
         if (passcode && req.headers['authorization'] !== passcode)
@@ -203,10 +210,14 @@ async function server({ port, action, passcode, contentLength, trust }: {
         return resolve({req, res})
     })
 
+    server.on('tlsClientError', (err, socket) => {
+        console.error('TLS client error:', err.message);
+    });
+
     server.listen(port);
 })}
 
-async function client({ hostname, port, action, validateFP, contentLength, passcode, trust }: {
+async function client(params: {
     hostname: string;
     port: number;
     action: 'send' | 'receive';
@@ -216,9 +227,11 @@ async function client({ hostname, port, action, validateFP, contentLength, passc
     trust: 'yes' | 'no' | 'ask';
 }): Promise<http.ClientRequest> { return new Promise(async (resolve) => {
 
+    const { hostname, port, action, validateFP, contentLength, passcode, trust } = params;
+
     const identity = await getKeyPair();
 
-    const spinner = terminal.spin(`%spin%  Connecting to ${hostname}`)
+    const spinner = terminal.spin(`%spin% Connecting to ${hostname} on port ${port}`)
 
     const req = https.request({
         hostname, port,
@@ -228,58 +241,63 @@ async function client({ hostname, port, action, validateFP, contentLength, passc
             'antenna-version': version(),
             'antenna-action': action,
             'antenna-hostname': os.hostname(),
-            'authorization': passcode,
-            'content-length': contentLength,
+            'authorization': passcode ?? '',
+            'content-length': contentLength ?? '',
             'expect': '100-continue',
         },
         ...identity,
-        rejectUnauthorized: false
+        rejectUnauthorized: false,
     })
 
-    req.on('socket', socket => socket.on('secureConnect', async () => {
-        req.flushHeaders();
 
-        const serverInfo: { 
-            version: string | null, 
-            hostname: string
-        } = await (() => new Promise((resolve) => req.on('response', async res => {
-            if (res.statusCode !== 100) {
-                await spinner.reject();
-                crash(`server replied '${res.statusCode} ${res.statusMessage}`);
+    req.on('socket', socket => {
+        socket.on('connectSecure', async () => {
+            const serverInfo: { 
+                version: string | null, 
+                hostname: string
+            } = await (() => new Promise((resolve) => req.on('response', async res => {
+                    if (res.statusCode !== 100) {
+                        await spinner.reject();
+                        crash(`server replied '${res.statusCode} ${res.statusMessage}`);
+                    }
+
+                    await spinner.resolve();
+
+                    const version = res.headers['antenna-version'];
+                    const hostname = res.headers['antenna-hostname'];
+
+                    return resolve({
+                        version: typeof version === 'string' ? version : null,
+                        hostname: typeof hostname === 'string' ? hostname : 'No Name'
+                    })
+                })))()
+
+            if (!validateFP) {
+                req.off('error', onErr);
+                return resolve(req);
             }
 
-            await spinner.resolve();
+            const serverIdentity = crypto.createPublicKey(
+                (socket as TLSSocket).getPeerCertificate(true).raw
+            ).export({ type: 'spki', format: 'pem' }) as string
 
-            const version = res.headers['antenna-version'];
-            const hostname = res.headers['antenna-hostname'];
+            const trusted = await checkIdentity(serverIdentity, serverInfo.hostname);
 
-            return resolve({
-                version: typeof version === 'string' ? version : null,
-                hostname: typeof hostname === 'string' ? hostname : 'No Name'
-            })
-        })))()
-        
-        if (!validateFP) {
+            if (!trusted) checkFingerprint(getFingerprint(identity.cert, serverIdentity));
+
+            handleTrusting(identity.cert, serverIdentity, trust);
+
             req.off('error', onErr);
-            return resolve(req);
-        }
-        
-        const serverIdentity = crypto.createPublicKey(
-            (socket as TLSSocket).getPeerCertificate(true).raw
-        ).export({ type: 'spki', format: 'pem' }) as string
+            resolve(req);
+        })
 
-        const trusted = await checkIdentity(serverIdentity, serverInfo.hostname);
-
-        if (!trusted) checkFingerprint(getFingerprint(identity.cert, serverIdentity));
-
-        handleTrusting(identity.cert, serverIdentity, trust);
-
-        req.off('error', onErr);
-        resolve(req);
-    }))
+        socket.on('error', onErr)
+    })
     
     async function onErr(e: unknown) {
         await spinner.reject();
+
+        if ((e as any).code === 'ERR_INVALID_URL') crash('invalid host')
 
         if (isSystemError(e)) syscrash(e as SystemError);
         throw e;
@@ -287,70 +305,41 @@ async function client({ hostname, port, action, validateFP, contentLength, passc
 
     req.on('error', onErr);
 
+    req.flushHeaders();
 }) }
 
 async function getKeyPair(): Promise<{ key: string, cert: string }> {
     const configDir = envPaths('antenna-ft').config;
     const keyPath = path.join(configDir, 'identity.key');
-    const certPath = path.join(configDir, 'selfId');
+    const certPath = path.join(configDir, 'identity.cert');
 
     await fs.mkdir(configDir, { recursive: true });
 
-    const key = await (async () => {
-        try {
-            return fs.readFile(keyPath, 'utf8');
-        } catch (err) {
+    try {
+        const [ key, cert ] = await Promise.all([
+            fs.readFile(keyPath, 'utf8'),
+            fs.readFile(certPath, 'utf8')
+        ]);
 
-            if ((err as SystemError)?.code === 'ENOENT') {
-                const { privateKey, publicKey } = crypto.generateKeyPairSync('ec', {
-                    namedCurve: 'P-256', 
-                    publicKeyEncoding: {
-                        type: 'spki',
-                        format: 'pem'
-                    },
-                    privateKeyEncoding: {
-                        type: 'pkcs8',
-                        format: 'pem'
-                    }
-                });
+        return { key, cert }
+    } catch (err) {
+        if ((err as SystemError)?.code === 'ENOENT') {
+            await execFileAsync("openssl", [
+                "req",
+                "-x509",
+                "-newkey", "ed25519",
+                "-nodes",
+                "-keyout", keyPath,
+                "-out", certPath,
+                "-days", "365000",
+                "-subj", "/CN=localhost"
+            ]);
 
-                await Promise.all([
-                    fs.writeFile(keyPath, privateKey, 'utf8'),
-                    fs.writeFile(certPath, publicKey, 'utf8')
-                ]);
+            await fs.chmod(keyPath, 0o600);
+            return getKeyPair();
 
-                await fs.chmod(keyPath, 0o600);
-
-                return privateKey;
-
-            } 
-
-            if (isSystemError(err)) syscrash(err as SystemError);
-
-            else throw err;
-        }
-    })();
-
-    const cert = await (async () => {
-        try {
-            return fs.readFile(certPath, 'utf8');
-        } catch (err) {
-            if ((err as SystemError)?.code === 'ENOENT') {
-                const publicKey = crypto.createPublicKey({ key, format: 'pem' })
-                    .export({
-                        type: 'spki',
-                        format: 'pem'
-                    }) as string;
-
-                await fs.writeFile(certPath, publicKey, 'utf8');
-
-                return publicKey;
-
-            } else throw err;
-        }
-    })();
-
-    return { key, cert };
+        } else throw err;
+    }
 }
 
 function getFingerprint(selfId: string, peerId: string) {
@@ -449,17 +438,17 @@ function isSystemError(e: unknown) {
 }
 
 function crash(errmsg: string, exitcode:number|null=1): never {
-    console.error(`failure: ${errmsg}`);
+    console.error(`fatal: ${errmsg}`);
     
     process.exit(exitcode)
 }
 
 function syscrash(e: SystemError): never {
-    const error = errno.errno[e.errno];
+    const error = errno.code[e.code];
 
     if (!error) throw e;
 
-    crash(`${error.description} (${error.code})${e.path && `: ${e.path}`}`);
+    crash(`${error.description} (${error.code})${e.path ? `: ${e.path}` : ''}`);
 }
 
 function warn(errmsg: string): void {
@@ -508,7 +497,7 @@ function attachProgressSpinner(actionText: string, length: number|undefined, rs:
 }
 
 function spinProgress(actionText: string, length: number|undefined) {
-    const spinner = terminal.spin(`%spin%  ${actionText}: -- MiB`);
+    const spinner = terminal.spin(`%spin% ${actionText}: -- MiB`);
 
     let lastReceived = 0;
     let totalReceived = 0;
@@ -532,7 +521,7 @@ function spinProgress(actionText: string, length: number|undefined) {
             ? history.reduce((a, b) => a + b, 0) / history.length 
             : 0;
 
-        let newSpinMsg = `%spin%  ${actionText}: ${receivedMiB}`
+        let newSpinMsg = `%spin% ${actionText}: ${receivedMiB}`
 
         if (length) {
             const percentage = Math.floor(totalReceived / length * 100);
@@ -572,10 +561,8 @@ type AppSettings = (
         { 
             mode: 'client';
             host: string;
-            port: number;
         } | {
             mode: 'server';
-            port: number;
         }
 ) & (
         {
@@ -589,6 +576,7 @@ type AppSettings = (
 ) & {
     passcode: string | undefined;
     trust: 'yes' | 'no' | 'ask';
+    port: number;
     validateFP: boolean;
 }
 

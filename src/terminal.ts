@@ -41,10 +41,10 @@ const terminal = {
 
     spin(msg: string) {
         const { spin, success, failure } = {
-            success: '✔',
-            failure: '✘',
+            success: ' ✔',
+            failure: ' ✘',
             spin: {
-                frames: ['◻', '◼'],
+                frames: [' ■', ' □'],
                 interval: 500
             }
         };
