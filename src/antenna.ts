@@ -1,11 +1,9 @@
 import { Command } from "commander";
-import { version } from "../macros";
 import prettyMs from "pretty-ms";
 
 // @ts-ignore just treat this as any for now as im too lazy to write declarations
 import errno from 'errno'
 import fsSync, { ReadStream, WriteStream } from 'fs'
-import type { SystemError } from "bun";
 
 import https from 'https';
 import http  from 'http';
@@ -30,7 +28,6 @@ parser
     .name('antenna')
     .usage('(--send | --receive) (--active <host> | --passive [port]) [other options]')
     .description('Quickly and securely transfer file over IP directly with no setup')
-    .version(version())
     
 parser
     .option('-S, --send',                       "Send file")
@@ -40,7 +37,7 @@ parser
     .option('-p, --passive [port]',             "Perform action passively (be the server). Port defaults to 52110")
 
     .option('-w, --passcode <passcode>',        "Specify authentication passcode")
-    .option('-n, --no-passcode',                    "Don't use authentication passcode as server")
+    .option('-n, --no-passcode',                "Don't use authentication passcode as server")
 
     .option('--no-validate-fp',                 "Don't validate connection fingerprint.")
     .option('-t, --trust [yes/no/ask]',         "Auto-trust/untrust identity when unknown")
@@ -51,6 +48,8 @@ parser
         CA_XOR('send', 'receive', 'you must specify one and only one of --send and --receive')(options);
         CA_XOR('active', 'passive', 'you must specify one and only one of --active and --passive')(options);
         CA_oneOf('trust', ['yes','no','ask',undefined])(options);
+        CA_type('passcode', ['boolean'])
+        console.log(options)
     })
     
 parser.parse();
@@ -62,23 +61,12 @@ const settings: AppSettings = {
     ...(() => {
         if (flags.active) return {
             mode: 'client',
-            ...(() => {
-                const endpoint = flags.active;
-                const match = endpoint.match( /^(.+?)(?::([0-9]{1,5}))?$/ );
-
-                if (!match) throw new Error(`Failed to parse endpoint "${endpoint}"`);
-
-                const host = match[1]!;
-                const port = match[2] !== undefined ? parseInt(match[2], 10) : 52110;
-
-                if (Number.isNaN(port)) throw new Error(`Unable to parse port. Match: ${match}`);
-
-                return { host };
-            })()
+            host: flags.active
         }
 
         else return {
             mode: 'server',
+            port: typeof flags.passive === 'number' ? flags.passive : 52110
         }
     })(),
 
@@ -113,40 +101,47 @@ const settings: AppSettings = {
 
     trust: flags.trust ?? 'ask',
     validateFP: !flags.noValidateFp,
-    port: typeof flags.passive === 'number' ? flags.passive : 52110
 }
 
 if (settings.mode === 'client') {
     const req = await client({
         ...settings,
-        hostname: settings.host,
+        url: new URL(`antenna://${settings.host}`),
         contentLength: (settings as { length: number|undefined }).length,
     });
+    terminal.println('');
 
     if (settings.action === 'send') {
         settings.readstream.pipe(req);
-        attachProgressSpinner('Transmitting Data', settings.length, settings.readstream)
+        await attachProgressSpinner('Transmitting Data', settings.length, settings.readstream)
 
     } else {
-        req.on('response', (res) => {
-            res.pipe(settings.writestream);
-            attachProgressSpinner('Receiving Data', toNumOrUndefined(res.headers['content-length']), res)
-        });
+        await new Promise<void>(resolve => {
+            req.on('response', async (res) => {
+                res.pipe(settings.writestream);
+                await attachProgressSpinner('Receiving Data', toNumOrUndefined(res.headers['content-length']), res)
+                resolve();
+            });
+            req.end();
+        })
     }
 } else {
     const { req, res } = await server({
         ...settings,
         contentLength: (settings as { length: number|undefined }).length
     })
+    terminal.println('');
 
     if (settings.action === 'send') {
         settings.readstream.pipe(res);
-        attachProgressSpinner('Transmitting Data', settings.length, settings.readstream)
+        await attachProgressSpinner('Transmitting Data', settings.length, settings.readstream)
     } else {
         req.pipe(settings.writestream);
-        attachProgressSpinner('Receiving Data', toNumOrUndefined(req.headers['content-length']), req)
+        await attachProgressSpinner('Receiving Data', toNumOrUndefined(req.headers['content-length']), req)
     }
 }
+
+terminal.println("All done!");
 
 async function server({ port, action, passcode, contentLength, trust }: {
     port: number;
@@ -160,66 +155,79 @@ async function server({ port, action, passcode, contentLength, trust }: {
     if (passcode) terminal.println(`Passcode: ${passcode}`);
     else terminal.println(`No passcode required`)
 
-    const spinner = terminal.spin(`%spin% Listening on port ${port}`)
+    const spinner = terminal.spin(`%spin% Awaiting connection on port ${port}`)
 
     const server = https.createServer({
         ...identity,
         requestCert: true,
         rejectUnauthorized: false
     }, async (req, res) => {
-        console.log('request received')
-        const cert = (req.socket as TLSSocket).getPeerCertificate();
+        try {
+            const cert = (req.socket as TLSSocket).getPeerCertificate();
 
-        if (passcode && req.headers['authorization'] !== passcode)
-            return res.writeHead(403).end('Forbidden\n');
+                console.log(req.headers)
 
-        if (!cert || Object.keys(cert).length === 0) 
-            return res.writeHead(496).end('Client Identity Required\n');
+            if (passcode && req.headers['authorization'] !== `${passcode}`)
+                return res.writeHead(403).end('Passcode Incorrect');
+
+            if (!cert || Object.keys(cert).length === 0) 
+                return res.writeHead(496).end('Client Identity Required');
+            
+            if (req.url !== '/v1/antenna') 
+                return res.writeHead(404).end('Not Found');
+
+            if (req.method !== 'POST') 
+                return res.writeHead(405).end('Method Not Allowed')
+
+            if (req.headers['antenna-action'] !== (action==='send' ? 'receive' : 'send'))
+                return res.writeHead(405).end('Incompatible Action')
+
+            server.close();
+
+            res.writeHead(200, {
+                'antenna-action': action,
+                'antenna-hostname': os.hostname(),
+                'antenna-content-length': contentLength ?? ''
+            })
+
+            res.flushHeaders();
+
+            await spinner.resolve();
+
+            const peerName = (() => {
+                const name = req.headers['antenna-hostname'];
+                return typeof name === 'string' ? name : 'No Name';
+            })();
         
-        if (req.url !== '/v1/antenna') 
-            return res.writeHead(404).end('Not Found\n');
+            const selfId = pemToRaw(identity.cert);
+            const peerId = cert.raw;
+            const peerHash = sha256(cert.raw);
 
-        if (req.headers['antenna-action'] === (action==='send' ? 'receive' : 'send'))
-            return res.writeHead(405).end('Incompatible Action\n')
+            const fp = getFingerprint(selfId, peerId).toUpperCase();
 
-        server.close();
+            terminal.println(`'${peerName}' has connected via ${req.socket.remoteAddress}!`)
+            terminal.println(`\nConnection Fingerprint: ${fp.slice(0,4)}-${fp.slice(4)}\n`);
 
-        res.writeHead(100, {
-            'antenna-version': version(),
-            'antenna-action': action,
-            'antenna-hostname': os.hostname(),
-            'content-length': contentLength
-        }).write("Continue\n")
+            if (!await checkIdentity(peerHash, peerName))
+                    await handleTrusting(peerHash, peerName, trust);
 
-        await spinner.resolve();
-
-        const peerId = crypto.createPublicKey(cert.raw)
-                             .export({ type: 'spki', format: 'pem' }) as string
-        const peerName = (() => {
-            const name = req.headers['antenna-hostname'];
-            return typeof name === 'string' ? name : 'No Name';
-        })();
-    
-        const fp = getFingerprint(identity.cert, peerId).toUpperCase();
-
-        terminal.println(`Connection Fingerprint: ${fp.slice(0,4)}-${fp.slice(4)}`);
-
-        if (!await checkIdentity(peerId, peerName))
-                handleTrusting(peerId, peerName, trust);
-
-        return resolve({req, res})
+            req.on('end', () => resolve({req, res}));
+            req.on('error', e => { throw e })
+        } catch (e) {
+            throw e;
+        }
     })
 
-    server.on('tlsClientError', (err, socket) => {
-        console.error('TLS client error:', err.message);
-    });
+    // error handling
+    server.on('error', e => { throw e });
+    server.on('clientError', e => { throw e });
+    server.on('tlsClientError', e => { throw e });
 
     server.listen(port);
 })}
 
 async function client(params: {
-    hostname: string;
-    port: number;
+    url: URL;
     action: 'send' | 'receive';
     validateFP: boolean;
     passcode: string | undefined;
@@ -227,71 +235,74 @@ async function client(params: {
     trust: 'yes' | 'no' | 'ask';
 }): Promise<http.ClientRequest> { return new Promise(async (resolve) => {
 
-    const { hostname, port, action, validateFP, contentLength, passcode, trust } = params;
+    const { url, action, validateFP, contentLength, passcode, trust } = params;
 
     const identity = await getKeyPair();
 
-    const spinner = terminal.spin(`%spin% Connecting to ${hostname} on port ${port}`)
+    const spinner = terminal.spin(`%spin% Connecting to ${url.host}`)
 
-    const req = https.request({
-        hostname, port,
+    if (url.port === '')
+        url.port = "52110";
+
+    url.pathname = '/v1/antenna'
+
+    const req = https.request(url, {
         path: '/v1/antenna',
+        protocol: 'https:',
         method: 'POST',
         headers: {
-            'antenna-version': version(),
+            'host': url.host,
+   //         'antenna-version': version(),
             'antenna-action': action,
             'antenna-hostname': os.hostname(),
             'authorization': passcode ?? '',
-            'content-length': contentLength ?? '',
-            'expect': '100-continue',
+            'antenna-content-length': contentLength ?? '',
         },
         ...identity,
+        setDefaultHeaders: false,
         rejectUnauthorized: false,
     })
 
+    req.on('response', async res => {
+        try {
+            if (res.statusCode !== 200) {
+                await spinner.reject();
+                crash(`server replied: ${res.statusCode} ${await (async () => {
+                    const chunks = [];
+                    for await (const chunk of res) chunks.push(chunk);
+                    return Buffer.concat(chunks).toString();
+                })()}`);
+            }
 
-    req.on('socket', socket => {
-        socket.on('connectSecure', async () => {
-            const serverInfo: { 
-                version: string | null, 
-                hostname: string
-            } = await (() => new Promise((resolve) => req.on('response', async res => {
-                    if (res.statusCode !== 100) {
-                        await spinner.reject();
-                        crash(`server replied '${res.statusCode} ${res.statusMessage}`);
-                    }
+            await spinner.resolve();
 
-                    await spinner.resolve();
+            const peerName = (() => {
+                const name = res.headers['antenna-hostname'];
+                return typeof name === 'string' ? name : 'No Name';
+            })();
 
-                    const version = res.headers['antenna-version'];
-                    const hostname = res.headers['antenna-hostname'];
-
-                    return resolve({
-                        version: typeof version === 'string' ? version : null,
-                        hostname: typeof hostname === 'string' ? hostname : 'No Name'
-                    })
-                })))()
+            const peerCert = (req.socket as TLSSocket).getPeerCertificate(true);
+            const peerId = peerCert.raw;
+            const peerHash = sha256(peerId)
+            const selfId = pemToRaw(identity.cert)
 
             if (!validateFP) {
                 req.off('error', onErr);
                 return resolve(req);
             }
 
-            const serverIdentity = crypto.createPublicKey(
-                (socket as TLSSocket).getPeerCertificate(true).raw
-            ).export({ type: 'spki', format: 'pem' }) as string
+            const trusted = await checkIdentity(peerHash, peerName);
 
-            const trusted = await checkIdentity(serverIdentity, serverInfo.hostname);
+            if (!trusted) await checkFingerprint(getFingerprint(peerId, selfId));
 
-            if (!trusted) checkFingerprint(getFingerprint(identity.cert, serverIdentity));
-
-            handleTrusting(identity.cert, serverIdentity, trust);
+            handleTrusting(peerHash, peerName, trust);
 
             req.off('error', onErr);
             resolve(req);
-        })
 
-        socket.on('error', onErr)
+        } catch (e) { 
+            throw e;
+        }
     })
     
     async function onErr(e: unknown) {
@@ -327,7 +338,9 @@ async function getKeyPair(): Promise<{ key: string, cert: string }> {
             await execFileAsync("openssl", [
                 "req",
                 "-x509",
-                "-newkey", "ed25519",
+                "-newkey", "ec",
+                "-pkeyopt", "ec_paramgen_curve:prime256v1", 
+                "-pkeyopt", "ec_param_enc:named_curve",     
                 "-nodes",
                 "-keyout", keyPath,
                 "-out", certPath,
@@ -342,15 +355,24 @@ async function getKeyPair(): Promise<{ key: string, cert: string }> {
     }
 }
 
-function getFingerprint(selfId: string, peerId: string) {
-    return crypto.createHash('sha256')
-                 .update(`${peerId}${selfId}`, 'utf8')
-                 .digest('hex')
-                 .slice(0, 8);
+function pemToRaw(pem: string): Buffer {
+    const b64 = pem.replace(/-----BEGIN CERTIFICATE-----/, '')
+                   .replace(/-----END CERTIFICATE-----/, '')
+                   .replace(/\s+/g, '');
+
+    return Buffer.from(b64, 'base64');
+}
+
+function getFingerprint(peer1: Buffer, peer2: Buffer) {
+    return sha256(Buffer.concat([peer1, peer2])).slice(0, 8);
+}
+
+function sha256(data: Buffer) {
+    return crypto.createHash('sha256').update(data).digest('hex');
 }
 
 async function checkFingerprint(fp: string) {
-    terminal.println("Enter the fingerprint code as shown on the server to verify connection integrety")
+    terminal.println("Enter the fingerprint code as shown on the other side to verify connection integrety")
 
     let attempts = 0;
     let input = "";
@@ -358,21 +380,19 @@ async function checkFingerprint(fp: string) {
     do {
         attempts++;
 
-        input = (await terminal.ask("code: ")).trim().replaceAll(/-| /, '').toLowerCase();
+        input = (await terminal.ask("code: ")).trim().replaceAll(/-| /g, '').toLowerCase();
 
         if (input !== fp) {
             terminal.println("Code does not match, try again.")
 
             if (attempts > 3)
-                terminal.println("\x1b[31mIf you did enter the correct code, this connection may have been hijacked.\x1b[0m")
+                terminal.println("\x1b[31mIf you did in fact enter the correct code, this connection may have been hijacked.\x1b[0m")
         }
 
     } while (input !== fp)
 }
 
-async function checkIdentity(peerId: string, peerName: string) {
-    const peerHash = crypto.createHash('sha256').update(peerId, 'utf8').digest('hex');
-
+async function checkIdentity(peerHash: string, peerName: string) {
     const existingName = await getIdentityInfo(peerHash);
 
     if (existingName) {
@@ -389,7 +409,7 @@ async function checkIdentity(peerId: string, peerName: string) {
     return false;
 }
 
-async function handleTrusting(identity: string, hostname: string, trust: 'yes'|'no'|'ask') {
+async function handleTrusting(peerHash: string, hostname: string, trust: 'yes'|'no'|'ask') {
     if (trust === 'ask') {
         if ((await terminal.ask('Trust this identity? [y/n] ')).includes('y'))
             trust = 'yes';
@@ -399,7 +419,7 @@ async function handleTrusting(identity: string, hostname: string, trust: 'yes'|'
     }
 
     if (trust === 'yes') {
-        setIdentityInfo(identity, hostname);
+        setIdentityInfo(peerHash, hostname);
         terminal.println(`Identity marked as trusted`);
     } else {
         terminal.println(`Not trusting this identity`);
@@ -483,7 +503,7 @@ function toNumOrUndefined(str: any) {
         else return num;
 }
 
-function attachProgressSpinner(actionText: string, length: number|undefined, rs: NodeJS.ReadableStream) {
+async function attachProgressSpinner(actionText: string, length: number|undefined, rs: NodeJS.ReadableStream) {
     const spinner = spinProgress(actionText, length);
 
     rs.on('data', (c: Buffer) => spinner.progress(c.length))
@@ -494,6 +514,8 @@ function attachProgressSpinner(actionText: string, length: number|undefined, rs:
             else throw e;
     })
     rs.on('close', () => spinner.finish());
+
+    return spinner.promise;
 }
 
 function spinProgress(actionText: string, length: number|undefined) {
@@ -553,7 +575,9 @@ function spinProgress(actionText: string, length: number|undefined) {
         async fail() {
             clearInterval(interval);
             return spinner.reject();
-        }
+        },
+
+        promise: spinner.promise
     }
 }
 
@@ -563,6 +587,7 @@ type AppSettings = (
             host: string;
         } | {
             mode: 'server';
+            port: number;
         }
 ) & (
         {
@@ -576,9 +601,25 @@ type AppSettings = (
 ) & {
     passcode: string | undefined;
     trust: 'yes' | 'no' | 'ask';
-    port: number;
     validateFP: boolean;
 }
+
+type SystemError = Error & {
+    code: string;
+    errno: number;
+    path?: string;
+}
+
+type TypeofResult =
+    | "undefined"
+    | "object"
+    | "boolean"
+    | "number"
+    | "bigint"
+    | "string"
+    | "symbol"
+    | "function";
+
 
 // (C)ommander (A)ctions
 function CA_XOR(flag1: string, flag2: string, errmsg: string) {
@@ -589,9 +630,10 @@ function CA_XOR(flag1: string, flag2: string, errmsg: string) {
     }
 }
 
-function CA_runIf(flag: string, callback: ()=>any) {
+function CA_type(flag: string, type: TypeofResult[]) {
     return function(option: Record<string, unknown>) {
-        if (option[flag]) callback()
+        if (!type.includes(`${option[flag]}` as TypeofResult))
+            crash(`'--${flag}' must be one of following type: ${type.join(', ')}. Got '${option[flag]}' instead.`)
     }
 }
 

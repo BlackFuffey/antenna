@@ -1,21 +1,26 @@
 {
     "name": "antenna",
-    "version": "0.0.1",
-    "module": "index.ts",
+    "version": "1.0.0",
+    "description": "Quickly and securely transfer file over direct IP with no setup",
+    "main": "index.js",
     "type": "module",
     "private": true,
     "scripts": {
-        "build": "bun build.ts"
-    },
-    "devDependencies": {
-        "@types/bun": "latest"
-    },
-    "peerDependencies": {
-        "typescript": "^5"
+        "test": "tsx src/antenna.ts"
     },
     "dependencies": {
         "commander": "^14.0.0",
         "env-paths": "^3.0.0",
         "pretty-ms": "^9.2.0"
+    },
+    "keywords": [],
+    "author": "",
+    "license": "ISC",
+    "packageManager": "pnpm@10.15.0",
+    "devDependencies": {
+        "@types/node": "^24.3.0",
+        "esbuild": "0.25.9",
+        "tsx": "^4.20.5",
+        "typescript": "^5.9.2"
     }
 }
