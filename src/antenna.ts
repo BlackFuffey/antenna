@@ -17,129 +17,122 @@ import envPaths from "env-paths";
 
 import { execFile } from 'child_process';
 import { promisify } from "util";
-
-const execFileAsync = promisify(execFile);
+import { Transform } from "stream";
+import Stream from "stream/promises";
 
 import terminal from "./terminal";
 
-const parser = new Command();
+async function main() {
+    const parser = new Command();
 
-parser
-    .name('antenna')
-    .usage('(--send | --receive) (--active <host> | --passive [port]) [other options]')
-    .description('Quickly and securely transfer file over IP directly with no setup')
-    
-parser
-    .option('-S, --send',                       "Send file")
-    .option('-R, --receive',                    "Receive file")
+    parser
+        .name('antenna')
+        .usage('(--send | --receive) (--active <host> | --passive [port]) [other options]')
+        .description('Quickly and securely transfer file over IP directly with no setup')
+        
+    parser
+        .option('-S, --send',                       "Send file")
+        .option('-R, --receive',                    "Receive file")
 
-    .option('-a, --active <host>',              "Perform action actively (be the client)")
-    .option('-p, --passive [port]',             "Perform action passively (be the server). Port defaults to 52110")
+        .option('-a, --active <host>',              "Perform action actively (be the client)")
+        .option('-p, --passive [port]',             "Perform action passively (be the server). Port defaults to 52110")
 
-    .option('-w, --passcode <passcode>',        "Specify authentication passcode")
-    .option('-n, --no-passcode',                "Don't use authentication passcode as server")
+        .option('-w, --passcode <passcode>',        "Specify authentication passcode")
+        .option('-n, --no-passcode',                "Don't use authentication passcode as server")
 
-    .option('--no-validate-fp',                 "Don't validate connection fingerprint.")
-    .option('-t, --trust [yes/no/ask]',         "Auto-trust/untrust identity when unknown")
+        .option('--no-validate-fp',                 "Don't validate connection fingerprint.")
+        .option('-t, --trust [yes/no/ask]',         "Auto-trust/untrust identity when unknown")
 
-    .option('-f, --file <path>',                "Which file to read from or write to (defaults to -)", '-')
+        .option('-f, --file <path>',                "Which file to read from or write to", '-')
 
-    .action((options) => {
-        CA_XOR('send', 'receive', 'you must specify one and only one of --send and --receive')(options);
-        CA_XOR('active', 'passive', 'you must specify one and only one of --active and --passive')(options);
-        CA_oneOf('trust', ['yes','no','ask',undefined])(options);
-        CA_type('passive', ['boolean', 'number', 'undefined'])(options);
-    })
-    
-parser.parse();
+        .action((options) => {
+            CA_XOR('send', 'receive', 'you must specify one and only one of --send and --receive')(options);
+            CA_XOR('active', 'passive', 'you must specify one and only one of --active and --passive')(options);
+            CA_oneOf('trust', ['yes','no','ask',undefined])(options);
+            CA_type('passive', ['boolean', 'number', 'undefined'])(options);
+        })
+        
+    parser.parse();
 
-const flags = parser.opts();
+    const flags = parser.opts();
 
-const settings: AppSettings = {
-    // Modes
-    ...(() => {
-        if (flags.active) return {
-            mode: 'client',
-            host: flags.active
-        }
-
-        else return {
-            mode: 'server',
-            port: typeof flags.passive === 'number' ? flags.passive : 52110
-        }
-    })(),
-
-    // Send or receive
-    ...(() => {
-        try {
-            if (flags.send) return {
-                action: 'send',
-                readstream: flags.file==='-' ? process.stdin : fsSync.createReadStream(flags.file),
-                length: flags.file==='-' ? undefined : getFileLengthSync(flags.file)
+    const settings: AppSettings = {
+        // Modes
+        ...(() => {
+            if (flags.active) return {
+                mode: 'client',
+                host: flags.active
             }
 
             else return {
-                action: 'receive',
-                writestream: flags.file==='-' ? process.stdout : fsSync.createWriteStream(flags.file)
+                mode: 'server',
+                port: typeof flags.passive === 'number' ? flags.passive : 52110
             }
-        } catch (e: unknown) {
-            if (isSystemError(e)) syscrash(e as SystemError);
+        })(),
 
-            else throw e;
-        }
-    })(),
+        // Send or receive
+        ...(() => {
+            try {
+                if (flags.send) return {
+                    action: 'send',
+                    readstream: flags.file==='-' ? process.stdin : fsSync.createReadStream(flags.file),
+                    length: flags.file==='-' ? undefined : getFileLengthSync(flags.file)
+                }
 
-    passcode: (() => {
-        if (flags.passcode === false) return undefined;
+                else return {
+                    action: 'receive',
+                    writestream: flags.file==='-' ? process.stdout : fsSync.createWriteStream(flags.file)
+                }
+            } catch (e: unknown) { handleError(e) }
+        })(),
 
-        if (flags.passive && [undefined, true].includes(flags.passcode)) 
-            return Math.floor(100000 + Math.random() * 900000);
+        passcode: (() => {
+            if (flags.passcode === false) return undefined;
 
-        else return flags.passcode
-    })(),
+            if (flags.passive && [undefined, true].includes(flags.passcode)) 
+                return crypto.randomInt(100000, 1000000).toString();
 
-    trust: flags.trust ?? 'ask',
-    validateFP: !flags.noValidateFp,
-}
+            else return flags.passcode
+        })(),
 
-if (settings.mode === 'client') {
-    const req = await client({
-        ...settings,
-        url: new URL(`antenna://${settings.host}`),
-        contentLength: (settings as { length: number|undefined }).length,
-    });
+        trust: flags.trust ?? 'ask',
+        validateFP: !flags.noValidateFp,
+    }
+
+    const { rs, ws } = 
+        (settings.mode === 'client') ? 
+            await client({
+                ...settings,
+                url: new URL(`antenna://${settings.host}`),
+                contentLength: (settings as { length: number|undefined }).length,
+            }) :
+            await server({
+                ...settings,
+                contentLength: (settings as { length: number|undefined }).length
+            })
+
     terminal.println('');
 
     if (settings.action === 'send') {
-        settings.readstream.pipe(req);
-        await attachProgressSpinner('Transmitting Data', settings.length, settings.readstream)
-
-    } else {
-        await new Promise<void>(resolve => {
-            req.on('response', async (res) => {
-                res.pipe(settings.writestream);
-                await attachProgressSpinner('Receiving Data', toNumOrUndefined(res.headers['content-length']), res)
-                resolve();
-            });
+        const spinner = writeAndCount({
+            rs: settings.readstream, ws,
+            length: settings.length,
+            actionText: 'Transmitting Data'
         })
-    }
-} else {
-    const { req, res } = await server({
-        ...settings,
-        contentLength: (settings as { length: number|undefined }).length
-    })
-    terminal.println('');
-
-    if (settings.action === 'send') {
-        settings.readstream.pipe(res);
-        await attachProgressSpinner('Transmitting Data', settings.length, settings.readstream)
+        await new Promise(resolve => rs.on('end', resolve));
+        await spinner;
     } else {
-        req.pipe(settings.writestream);
-        await attachProgressSpinner('Receiving Data', toNumOrUndefined(req.headers['content-length']), req)
+        const spinner = writeAndCount({
+            rs, ws: settings.writestream,
+            length: toNumOrUndefined(rs.headers['antenna-content-length']),
+            actionText: 'Receiving Data'
+        })
+        ws.end();
+        await spinner;
     }
-}
 
-terminal.println("All done!");
+    terminal.println("All done!");
+}
 
 async function server({ port, action, passcode, contentLength, trust, validateFP }: {
     port: number;
@@ -148,7 +141,7 @@ async function server({ port, action, passcode, contentLength, trust, validateFP
     contentLength: number | undefined;
     trust: 'yes' | 'no' | 'ask';
     validateFP: boolean;
-}) { return new Promise<{req:http.IncomingMessage, res:http.ServerResponse}>(async (resolve) => {
+}) { return new Promise<{rs:http.IncomingMessage,ws:http.ServerResponse}>(async (resolve) => {
     const identity = await getKeyPair();
 
     if (passcode) terminal.println(`Passcode: ${passcode}`);
@@ -181,7 +174,7 @@ async function server({ port, action, passcode, contentLength, trust, validateFP
 
             server.close();
 
-            req.on('error', e => { throw e })
+            req.on('error', handleError);
 
             res.writeHead(200, {
                 'antenna-action': action,
@@ -208,10 +201,8 @@ async function server({ port, action, passcode, contentLength, trust, validateFP
 
             if (validateFP) await verifyConnection({ peerName, peerHash, fp, trust });
 
-            resolve({req, res})
-        } catch (e) {
-            throw e;
-        }
+            return resolve({rs:req, ws:res})
+        } catch (e) { handleError(e) }
     })
 
     // error handling
@@ -229,7 +220,7 @@ async function client(params: {
     passcode: string | undefined;
     contentLength: number | undefined;
     trust: 'yes' | 'no' | 'ask';
-}): Promise<http.ClientRequest> { return new Promise(async (resolve) => {
+}): Promise<{ws:http.ClientRequest,rs:http.IncomingMessage}> { return new Promise(async (resolve) => {
 
     const { url, action, validateFP, contentLength, passcode, trust } = params;
 
@@ -263,7 +254,7 @@ async function client(params: {
         try {
             if (res.statusCode !== 200) {
                 await spinner.reject();
-                crash(`server replied: ${res.statusCode} ${await (async () => {
+                crash(`peer replied: ${res.statusCode} ${await (async () => {
                     const chunks = [];
                     for await (const chunk of res) chunks.push(chunk);
                     return Buffer.concat(chunks).toString();
@@ -282,25 +273,12 @@ async function client(params: {
             const peerHash = sha256(peerId)
             const selfId = pemToRaw(identity.cert)
 
-            if (!validateFP) {
-                req.off('error', onErr);
-                return resolve(req);
-            }
+            if (validateFP) 
+                await verifyConnection({ peerHash, peerName, fp: getFingerprint(peerId, selfId), trust })
 
-            const trusted = await checkIdentity(peerHash, peerName);
+            return resolve({ ws: req, rs: res });
 
-            if (!trusted) await checkFingerprint(getFingerprint(peerId, selfId));
-
-            await handleTrusting(peerHash, peerName, trust);
-
-            req.off('error', onErr);
-            req.end();
-
-            resolve(req);
-
-        } catch (e) { 
-            throw e;
-        }
+        } catch (e) { handleError(e) }
     })
     
     async function onErr(e: unknown) {
@@ -308,8 +286,7 @@ async function client(params: {
 
         if ((e as any).code === 'ERR_INVALID_URL') crash('invalid host')
 
-        if (isSystemError(e)) syscrash(e as SystemError);
-        throw e;
+        handleError(e);
     }
 
     req.on('error', onErr);
@@ -333,7 +310,7 @@ async function getKeyPair(): Promise<{ key: string, cert: string }> {
         return { key, cert }
     } catch (err) {
         if ((err as SystemError)?.code === 'ENOENT') {
-            await execFileAsync("openssl", [
+            await promisify(execFile)("openssl", [
                 "req",
                 "-x509",
                 "-newkey", "ec",
@@ -371,6 +348,7 @@ function sha256(data: Buffer) {
 
 async function verifyConnection({ peerHash, peerName, fp, trust }: { peerHash: string, peerName: string, fp: string, trust: 'yes'|'no'|'ask' }) {
     const existingName = await getIdentityInfo(peerHash);
+    fp = fp.toUpperCase();
 
     if ((() => {
         if (existingName) {
@@ -380,19 +358,19 @@ async function verifyConnection({ peerHash, peerName, fp, trust }: { peerHash: s
             }
 
             terminal.println(`'${peerName}' has a trusted identity (${peerHash})`);
-            return true;
+            return false;
         }
 
         terminal.println(`'${peerName}' has an unknown identity (${peerHash})`)
-        return false;
+        return true;
     })()) {
         terminal.println(`Connection Fingerprint: ${fp.slice(0,4)}-${fp.slice(4)}`)
-        terminal.println('Is the code shown above identical on the other side?')
+        terminal.println('Is the code shown above identical to the other side?')
         
         if (!(await terminal.ask('[y/n] ')).toLowerCase().includes('y'))
             crash("can't verify connection integrity, aborting")
 
-    } else trust = 'yes';
+    } else return;
 
 
     if (trust === 'ask') {
@@ -432,10 +410,19 @@ async function setIdentityInfo(identity: string, hostname?: string) {
 
     await fs.mkdir(configDir, { recursive: true });
 
-    const list = JSON.parse(await fs.readFile(trustListPath, 'utf8'));
-    list[identity] = hostname;
-    
-    return fs.writeFile(trustListPath, JSON.stringify(list));
+    try {
+        const list = JSON.parse(await fs.readFile(trustListPath, 'utf8'));
+        list[identity] = hostname;
+
+        return fs.writeFile(trustListPath, JSON.stringify(list));
+    } catch (e) {
+        if ((e as SystemError)?.code === 'ENOENT') {
+            fs.writeFile(trustListPath, '{}');
+            return setIdentityInfo(identity, hostname);
+        }
+
+        throw e;
+    }
 }
 
 function isSystemError(e: unknown) {
@@ -465,7 +452,7 @@ function syswarn(e: SystemError): void {
 
     if (!error) throw e;
 
-    warn(`${error.description} (${error.code})${e.path && `: ${e.path}`}`);
+    warn(`${error.description} (${error.code})${e.path ? `: ${e.path}` : ''}`);
 }
 
 function getFileLengthSync(filepath: string): number | undefined {
@@ -488,18 +475,28 @@ function toNumOrUndefined(str: any) {
         else return num;
 }
 
-async function attachProgressSpinner(actionText: string, length: number|undefined, rs: NodeJS.ReadableStream) {
+async function writeAndCount({ actionText, length, rs, ws }: {
+    actionText: string;
+    length: number | undefined;
+    rs: NodeJS.ReadableStream;
+    ws: NodeJS.WritableStream;
+}) {
     const spinner = spinProgress(actionText, length);
 
-    rs.on('data', (c: Buffer) => spinner.progress(c.length))
-    rs.on('error', async (e: unknown) => {
+    const counter = new Transform({
+        transform(chunk, _enc, cb) {
+            spinner.progress(chunk.length);
+            cb(null, chunk); // pass chunk through unchanged
+        },
+    });
+
+    try {
+        await Stream.pipeline(rs, counter, ws);
+        spinner.finish();
+    } catch (e) {
         await spinner.fail();
-
-        if (isSystemError(e)) syscrash(e as SystemError);
-            else throw e;
-    })
-    rs.on('close', () => spinner.finish());
-
+        handleError(e);
+    }
     return spinner.promise;
 }
 
@@ -566,6 +563,12 @@ function spinProgress(actionText: string, length: number|undefined) {
     }
 }
 
+function handleError(e: unknown): never {
+    if (isSystemError(e)) syscrash(e as SystemError);
+    
+    throw e;
+}
+
 type AppSettings = (
         { 
             mode: 'client';
@@ -628,3 +631,5 @@ function CA_oneOf(flag: string, possibilities: any[]) {
             crash(`'--${flag}' must be one of: ${possibilities.join(', ')}`);
     }
 }
+
+main().catch(e => { throw e });
