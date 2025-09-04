@@ -141,12 +141,13 @@ if (settings.mode === 'client') {
 
 terminal.println("All done!");
 
-async function server({ port, action, passcode, contentLength, trust }: {
+async function server({ port, action, passcode, contentLength, trust, validateFP }: {
     port: number;
     action: 'send' | 'receive';
     passcode: string | undefined;
     contentLength: number | undefined;
     trust: 'yes' | 'no' | 'ask';
+    validateFP: boolean;
 }) { return new Promise<{req:http.IncomingMessage, res:http.ServerResponse}>(async (resolve) => {
     const identity = await getKeyPair();
 
@@ -180,6 +181,8 @@ async function server({ port, action, passcode, contentLength, trust }: {
 
             server.close();
 
+            req.on('error', e => { throw e })
+
             res.writeHead(200, {
                 'antenna-action': action,
                 'antenna-hostname': os.hostname(),
@@ -202,16 +205,10 @@ async function server({ port, action, passcode, contentLength, trust }: {
             const fp = getFingerprint(selfId, peerId).toUpperCase();
 
             terminal.println(`'${peerName}' has connected via ${req.socket.remoteAddress}!`)
-            terminal.println(`\nConnection Fingerprint: ${fp.slice(0,4)}-${fp.slice(4)}\n`);
 
-            if (!await checkIdentity(peerHash, peerName))
-                    await handleTrusting(peerHash, peerName, trust);
+            if (validateFP) await verifyConnection({ peerName, peerHash, fp, trust });
 
-            req.on('end', () => {
-                console.log('Request stream ended!')
-                resolve({req, res})
-            });
-            req.on('error', e => { throw e })
+            resolve({req, res})
         } catch (e) {
             throw e;
         }
@@ -372,47 +369,34 @@ function sha256(data: Buffer) {
     return crypto.createHash('sha256').update(data).digest('hex');
 }
 
-async function checkFingerprint(fp: string) {
-    terminal.println("Enter the fingerprint code as shown on the other side to verify connection integrety")
-
-    let attempts = 0;
-    let input = "";
-
-    do {
-        attempts++;
-
-        input = (await terminal.ask("code: ")).trim().replaceAll(/-| /g, '').toLowerCase();
-
-        if (input !== fp) {
-            terminal.println("Code does not match, try again.")
-
-            if (attempts > 3)
-                terminal.println("\x1b[31mIf you did in fact enter the correct code, this connection may have been hijacked.\x1b[0m")
-        }
-
-    } while (input !== fp)
-}
-
-async function checkIdentity(peerHash: string, peerName: string) {
+async function verifyConnection({ peerHash, peerName, fp, trust }: { peerHash: string, peerName: string, fp: string, trust: 'yes'|'no'|'ask' }) {
     const existingName = await getIdentityInfo(peerHash);
 
-    if (existingName) {
-        if (existingName !== peerName) {
-            terminal.println(`'${peerName}' was previously known as '${existingName}' (${peerHash})`);
-            setIdentityInfo(peerHash, peerName);
+    if ((() => {
+        if (existingName) {
+            if (existingName !== peerName) {
+                terminal.println(`'${peerName}' was previously known as '${existingName}' (${peerHash})`);
+                setIdentityInfo(peerHash, peerName);
+            }
+
+            terminal.println(`'${peerName}' has a trusted identity (${peerHash})`);
+            return true;
         }
 
-        terminal.println(`'${peerName}' has a trusted identity (${peerHash})`);
-        return true;
-    }
+        terminal.println(`'${peerName}' has an unknown identity (${peerHash})`)
+        return false;
+    })()) {
+        terminal.println(`Connection Fingerprint: ${fp.slice(0,4)}-${fp.slice(4)}`)
+        terminal.println('Is the code shown above identical on the other side?')
+        
+        if (!(await terminal.ask('[y/n] ')).toLowerCase().includes('y'))
+            crash("can't verify connection integrity, aborting")
 
-    terminal.println(`'${peerName}' has an unknown identity (${peerHash})`)
-    return false;
-}
+    } else trust = 'yes';
 
-async function handleTrusting(peerHash: string, hostname: string, trust: 'yes'|'no'|'ask') {
+
     if (trust === 'ask') {
-        if ((await terminal.ask('Trust this identity? [y/n] ')).includes('y'))
+        if ((await terminal.ask('Trust this identity from now on? [y/n] ')).includes('y'))
             trust = 'yes';
 
         else
@@ -420,7 +404,7 @@ async function handleTrusting(peerHash: string, hostname: string, trust: 'yes'|'
     }
 
     if (trust === 'yes') {
-        setIdentityInfo(peerHash, hostname);
+        setIdentityInfo(peerHash, peerName);
         terminal.println(`Identity marked as trusted`);
     } else {
         terminal.println(`Not trusting this identity`);
