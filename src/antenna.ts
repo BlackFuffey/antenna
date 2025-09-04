@@ -48,8 +48,7 @@ parser
         CA_XOR('send', 'receive', 'you must specify one and only one of --send and --receive')(options);
         CA_XOR('active', 'passive', 'you must specify one and only one of --active and --passive')(options);
         CA_oneOf('trust', ['yes','no','ask',undefined])(options);
-        CA_type('passcode', ['boolean'])
-        console.log(options)
+        CA_type('passive', ['boolean', 'number', 'undefined'])(options);
     })
     
 parser.parse();
@@ -122,7 +121,6 @@ if (settings.mode === 'client') {
                 await attachProgressSpinner('Receiving Data', toNumOrUndefined(res.headers['content-length']), res)
                 resolve();
             });
-            req.end();
         })
     }
 } else {
@@ -164,8 +162,6 @@ async function server({ port, action, passcode, contentLength, trust }: {
     }, async (req, res) => {
         try {
             const cert = (req.socket as TLSSocket).getPeerCertificate();
-
-                console.log(req.headers)
 
             if (passcode && req.headers['authorization'] !== `${passcode}`)
                 return res.writeHead(403).end('Passcode Incorrect');
@@ -211,7 +207,10 @@ async function server({ port, action, passcode, contentLength, trust }: {
             if (!await checkIdentity(peerHash, peerName))
                     await handleTrusting(peerHash, peerName, trust);
 
-            req.on('end', () => resolve({req, res}));
+            req.on('end', () => {
+                console.log('Request stream ended!')
+                resolve({req, res})
+            });
             req.on('error', e => { throw e })
         } catch (e) {
             throw e;
@@ -295,9 +294,11 @@ async function client(params: {
 
             if (!trusted) await checkFingerprint(getFingerprint(peerId, selfId));
 
-            handleTrusting(peerHash, peerName, trust);
+            await handleTrusting(peerHash, peerName, trust);
 
             req.off('error', onErr);
+            req.end();
+
             resolve(req);
 
         } catch (e) { 
@@ -632,7 +633,7 @@ function CA_XOR(flag1: string, flag2: string, errmsg: string) {
 
 function CA_type(flag: string, type: TypeofResult[]) {
     return function(option: Record<string, unknown>) {
-        if (!type.includes(`${option[flag]}` as TypeofResult))
+        if (!type.includes(typeof option[flag] as TypeofResult))
             crash(`'--${flag}' must be one of following type: ${type.join(', ')}. Got '${option[flag]}' instead.`)
     }
 }
