@@ -7,6 +7,7 @@ console.log(await ESBuild.build({
     treeShaking: true,
     target: [ 'node20' ],
     minify: true,
-    format: 'esm',
+    format: 'cjs',
     outfile: 'dist/antenna.js',
+    external: ['node:events']
 }))
