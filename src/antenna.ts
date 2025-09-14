@@ -114,21 +114,22 @@ async function main() {
     terminal.println('');
 
     if (settings.action === 'send') {
-        const spinner = writeAndCount({
+        const pipeline = writeAndCount({
             rs: settings.readstream, ws,
             length: settings.length,
             actionText: 'Transmitting Data'
         })
+        // await for any data to signal continue
         await new Promise(resolve => rs.on('end', resolve));
-        await spinner;
+        await pipeline.start();
     } else {
-        const spinner = writeAndCount({
+        const promise = writeAndCount({
             rs, ws: settings.writestream,
             length: toNumOrUndefined(rs.headers['antenna-content-length']),
             actionText: 'Receiving Data'
-        })
+        }).start();
         ws.end();
-        await spinner;
+        await promise;
     }
 
     terminal.println("All done!");
@@ -175,6 +176,7 @@ async function server({ port, action, passcode, contentLength, trust, validateFP
             server.close();
 
             req.on('error', handleError);
+            req.on('end', () => console.log('request ended!'))
 
             res.writeHead(200, {
                 'antenna-action': action,
@@ -475,7 +477,7 @@ function toNumOrUndefined(str: any) {
         else return num;
 }
 
-async function writeAndCount({ actionText, length, rs, ws }: {
+function writeAndCount({ actionText, length, rs, ws }: {
     actionText: string;
     length: number | undefined;
     rs: NodeJS.ReadableStream;
@@ -490,14 +492,17 @@ async function writeAndCount({ actionText, length, rs, ws }: {
         },
     });
 
-    try {
-        await Stream.pipeline(rs, counter, ws);
-        spinner.finish();
-    } catch (e) {
-        await spinner.fail();
-        handleError(e);
-    }
-    return spinner.promise;
+    return {async start() {
+        try {
+            await Stream.pipeline(rs, counter, ws);
+            spinner.finish();
+        } catch (e) {
+            await spinner.fail();
+            handleError(e);
+        }
+        return spinner.promise;
+    }}
+
 }
 
 function spinProgress(actionText: string, length: number|undefined) {

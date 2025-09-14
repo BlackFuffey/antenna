@@ -8,6 +8,9 @@ console.log(await ESBuild.build({
     target: [ 'node20' ],
     minify: true,
     format: 'cjs',
-    outfile: 'dist/antenna.js',
-    external: ['node:events']
+    outfile: 'dist/antenna',
+    external: ['node:*'],
+    banner: {
+        js: '#!/usr/bin/env node'
+    }
 }))

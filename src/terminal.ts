@@ -1,10 +1,10 @@
 import tty from 'tty';
-import fs from 'fs/promises';
+import fsSync from 'fs';
 import readline from 'readline'
 
-const ttyfile = await fs.open('/dev/tty', 'r+');
-const input = new tty.ReadStream(ttyfile.fd);
-const output = new tty.WriteStream(ttyfile.fd);
+const ttyfile = fsSync.openSync('/dev/tty', 'r+');
+const input = new tty.ReadStream(ttyfile);
+const output = new tty.WriteStream(ttyfile);
 
 let lineLocked = false;
 

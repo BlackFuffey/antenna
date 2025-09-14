@@ -6,7 +6,8 @@
     "type": "module",
     "private": true,
     "scripts": {
-        "test": "tsx src/antenna.ts"
+        "test": "tsx src/antenna.ts",
+        "build": "node build.js"
     },
     "dependencies": {
         "commander": "^14.0.0",
